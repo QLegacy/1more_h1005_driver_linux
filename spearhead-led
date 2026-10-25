@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+"""spearhead-led: подсветка 1MORE Spearhead VR (USB 0d8c:0172) без родного ПО.
+
+  spearhead-led                        открыть окно (GUI)
+  spearhead-led gui
+  spearhead-led off            [--send]
+  spearhead-led constant  RRGGBB [--send]
+  spearhead-led breathe   RRGGBB [10..100] [--send]   10 = быстро, 100 = медленно
+  spearhead-led heartbeat RRGGBB [--send]
+
+Без --send CLI делает сухой прогон и ничего не пишет в устройство.
+Протокол снят только с 1MORE Spearhead VR. Другие модели (например VRX)
+программа не трогает, пока не передан параметр
+  --i-know-that-this-will-ruin-my-headphones
+"""
+import glob
+import os
+import subprocess
+import sys
+import time
+
+SYSFS = os.environ.get("SPEARHEAD_SYSFS", "/sys")  # подмена только для тестов
+FORCE_FLAG = "--i-know-that-this-will-ruin-my-headphones"
+
+VID, PID, PRODUCT = "0d8c", "0172", "1MORE Spearhead VR"
+# HID report descriptor, снятый с проверенных наушников (91 байт)
+KNOWN_DESC = bytes.fromhex(
+    "050c0901a10185011500250109e909ea7501950281420601ff0901950a8106050c09cd09b709b5"
+    "09b6950481060607ff09017508950d81060900950f910285ff7508950f81030900950f910285f2"
+    "7508950f81030900950f9102c0"
+)
+
+EXIT_USAGE, EXIT_REFUSED, EXIT_NODEV, EXIT_IO, EXIT_PERM, EXIT_CRASH = 2, 3, 4, 5, 6, 7
+SCRIPT = os.path.realpath(__file__)
+
+
+# ---------------------------------------------------------------- устройство
+class Refused(Exception):
+    pass
+
+
+class NoDevice(Exception):
+    pass
+
+
+class Dev:
+    def __init__(self, node, vid, pid, product, desc):
+        self.node, self.vid, self.pid, self.product = node, vid, pid, product
+        self.problems = []
+        if vid != VID or pid != PID:
+            self.problems.append(f"USB ID {vid}:{pid}, а нужен {VID}:{PID}")
+        if product != PRODUCT:
+            self.problems.append(f"название «{product}», а нужно «{PRODUCT}»")
+        if desc != KNOWN_DESC:
+            self.problems.append("HID-дескриптор не совпадает с проверенным")
+
+    def title(self):
+        return f"{self.product or '?'} ({self.vid}:{self.pid}, {self.node})"
+
+
+def _read(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _text(path):
+    b = _read(path)
+    return b.decode(errors="replace").strip() if b is not None else None
+
+
+def scan():
+    devs = []
+    for h in sorted(glob.glob(f"{SYSFS}/class/hidraw/hidraw*")):
+        d = os.path.realpath(h + "/device")
+        usb = d
+        for _ in range(4):  # HID -> интерфейс -> USB-устройство
+            usb = os.path.dirname(usb)
+            if os.path.exists(usb + "/idVendor"):
+                break
+        else:
+            continue
+        vid = (_text(usb + "/idVendor") or "").lower()
+        pid = (_text(usb + "/idProduct") or "").lower()
+        product = _text(usb + "/product")
+        node = "/dev/" + os.path.basename(h)
+        devs.append(Dev(node, vid, pid, product, _read(d + "/report_descriptor")))
+    return devs
+
+
+def resolve(force=False):
+    """Вернёт подходящее устройство или бросит NoDevice / Refused."""
+    devs = scan()
+    for d in devs:
+        if not d.problems:
+            return d
+    near = [d for d in devs
+            if d.vid == VID or "spearhead" in (d.product or "").lower()
+            or "1more" in (d.product or "").lower()]
+    if not near:
+        raise NoDevice("Наушники не найдены. Они воткнуты и не проброшены в виртуалку?")
+    if force:
+        return near[0]
+    d = near[0]
+    raise Refused(
+        "Это не те наушники, под которые написан протокол.\n\n"
+        f"Найдено: {d.title()}\n"
+        "Не совпало:\n  - " + "\n  - ".join(d.problems) + "\n\n"
+        "Протокол снят только с 1MORE Spearhead VR. Значения могут не подходить, "
+        "а запись неподходящих данных в чужую прошивку способна её испортить.\n"
+        "Иди проверь модель, а не жми кнопки наугад.\n\n"
+        f"Если ты точно уверен, запусти с параметром\n  {FORCE_FLAG}"
+    )
+
+
+# ------------------------------------------------------------------- протокол
+def frames(hdr, rgb):
+    f = [bytes([0xFF, 0x02]) + bytes(14),
+         bytes([0xFF, 0x03]) + bytes.fromhex(hdr).ljust(14, b"\x00")]
+    table = bytes(c * (127 - i) // 127 for i in range(128) for c in rgb)
+    for b in range(32):
+        f.append(bytes([0xFF, 0x04, b * 4, 0x00]) + table[b * 12:(b + 1) * 12])
+    f.append(bytes([0xFF, 0x01]) + bytes(14))
+    return f
+
+
+def parse_color(s):
+    s = s.lstrip("#")
+    if len(s) != 6:
+        raise ValueError("цвет: RRGGBB")
+    return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def build(mode, color="000000", speed=100):
+    rgb = parse_color(color)
+    if mode == "off":
+        return frames("0001", (0, 0, 0))
+    if mode == "constant":
+        return frames("0001", rgb)
+    if mode == "breathe":
+        if not 10 <= int(speed) <= 100:
+            raise ValueError("скорость 10..100")
+        return frames("028000%02x" % int(speed), rgb)
+    if mode == "heartbeat":
+        return frames("0380", rgb)
+    raise ValueError("режим: off | constant | breathe | heartbeat")
+
+
+def write_frames(node, fr):
+    fd = os.open(node, os.O_RDWR)
+    try:
+        for x in fr:
+            os.write(fd, x)
+            time.sleep(0.001)
+    finally:
+        os.close(fd)
+
+
+# ------------------------------------------------------------------------ CLI
+def cli(argv):
+    force = FORCE_FLAG in argv
+    send = "--send" in argv
+    args = [a for a in argv if a not in ("--send", FORCE_FLAG)]
+    usage = ("usage: spearhead-led [gui] | off | constant RRGGBB | breathe RRGGBB [10..100] "
+             f"| heartbeat RRGGBB  [--send] [{FORCE_FLAG}]")
+    try:
+        mode = args[0]
+        color = args[1] if len(args) > 1 else "000000"
+        speed = int(args[2]) if len(args) > 2 else 100
+        fr = build(mode, color, speed)
+    except (IndexError, ValueError) as e:
+        print(usage if isinstance(e, IndexError) else f"{e}\n{usage}", file=sys.stderr)
+        return EXIT_USAGE
+    try:
+        dev = resolve(force)
+    except NoDevice as e:
+        print(e, file=sys.stderr)
+        return EXIT_NODEV
+    except Refused as e:
+        print(e, file=sys.stderr)
+        return EXIT_REFUSED
+    if dev.problems:
+        print("ВНИМАНИЕ: проверка модели пропущена, не совпало: "
+              + "; ".join(dev.problems), file=sys.stderr)
+    print(f"{dev.node}: {len(fr)} кадров, заголовок {fr[1].hex()}")
+    if not send:
+        print("сухой прогон, ничего не отправлено (добавь --send)")
+        return 0
+    try:
+        write_frames(dev.node, fr)
+    except PermissionError:
+        print(f"нет доступа к {dev.node}, нужен root", file=sys.stderr)
+        return EXIT_PERM
+    except OSError as e:
+        print(f"ошибка записи: {e}", file=sys.stderr)
+        return EXIT_IO
+    print("готово")
+    return 0
+
+
+# ------------------------------------------------------------------------ GUI
+def gui(force):
+    try:
+        import tkinter as tk
+        from tkinter import colorchooser, messagebox, simpledialog
+    except ImportError:
+        print("Нет tkinter. На Arch это пакет tk (python его не включает).", file=sys.stderr)
+        return EXIT_USAGE
+
+    root = tk.Tk()
+    root.title("Spearhead VR LED")
+    root.resizable(False, False)
+
+    state = {"pw": None}
+    mode = tk.StringVar(value="breathe")
+    color = tk.StringVar(value="#c80303")
+    speed = tk.IntVar(value=100)
+    status = tk.StringVar(value="")
+
+    pad = {"padx": 12, "pady": 4}
+    tk.Label(root, text="Подсветка 1MORE Spearhead VR", font=("", 13, "bold")).pack(**pad)
+    dev_label = tk.Label(root, text="", justify="left")
+    dev_label.pack(**pad)
+
+    mf = tk.LabelFrame(root, text="Режим")
+    mf.pack(fill="x", **pad)
+    for text, val in (("Выкл", "off"), ("Постоянный", "constant"),
+                      ("Дыхание", "breathe"), ("Пульс (heart beat)", "heartbeat")):
+        tk.Radiobutton(mf, text=text, value=val, variable=mode,
+                       command=lambda: refresh()).pack(anchor="w", padx=8)
+
+    cf = tk.LabelFrame(root, text="Цвет")
+    cf.pack(fill="x", **pad)
+    swatch = tk.Label(cf, width=6, relief="sunken", bg=color.get())
+    swatch.grid(row=0, column=0, padx=8, pady=6)
+    pick_btn = tk.Button(cf, text="Выбрать цвет…")
+    pick_btn.grid(row=0, column=1, padx=4)
+    hex_entry = tk.Entry(cf, textvariable=color, width=9)
+    hex_entry.grid(row=0, column=2, padx=8)
+    presets = tk.Frame(cf)
+    presets.grid(row=1, column=0, columnspan=3, pady=(0, 6))
+
+    def set_color(c):
+        color.set(c)
+        refresh()
+
+    for c in ("#ff0000", "#ff8000", "#ffff00", "#00ff00", "#0066ff", "#00c8ff", "#ff00ff"):
+        tk.Button(presets, bg=c, activebackground=c, width=3,
+                  command=lambda c=c: set_color(c)).pack(side="left", padx=2)
+
+    def choose():
+        res = colorchooser.askcolor(color=color.get(), parent=root, title="Цвет подсветки")
+        if res and res[1]:
+            set_color(res[1])
+
+    pick_btn.config(command=choose)
+
+    sf = tk.LabelFrame(root, text="Скорость дыхания")
+    sf.pack(fill="x", **pad)
+    scale = tk.Scale(sf, from_=10, to=100, orient="horizontal", variable=speed,
+                     length=260, showvalue=True)
+    scale.pack(padx=8)
+    tk.Label(sf, text="← быстро                          медленно →").pack()
+
+    def refresh():
+        m = mode.get()
+        st = "normal" if m != "off" else "disabled"
+        pick_btn.config(state=st)
+        hex_entry.config(state=st)
+        scale.config(state="normal" if m == "breathe" else "disabled")
+        try:
+            swatch.config(bg=color.get())
+        except tk.TclError:
+            pass
+
+    def set_status(text, ok=True):
+        status.set(text)
+        status_lbl.config(fg="#1a7f37" if ok else "#c0392b")
+
+    def check_device():
+        try:
+            d = resolve(force)
+        except NoDevice as e:
+            dev_label.config(text=str(e), fg="#c0392b")
+            return None
+        except Refused as e:
+            dev_label.config(text="Устройство не подходит (подробности при «Применить»)",
+                             fg="#c0392b")
+            return e
+        if d.problems:
+            dev_label.config(text=f"ПРОВЕРКА ОТКЛЮЧЕНА ключом.\n{d.title()}\n"
+                                  "Не совпало: " + "; ".join(d.problems), fg="#c0392b")
+        else:
+            dev_label.config(text=f"Найдено: {d.title()}", fg="#1a7f37")
+        return d
+
+    def run_as_root(argv):
+        """sudo с запросом пароля у пользователя. Пароль живёт только в памяти."""
+        for _ in range(3):
+            if state["pw"] is None:
+                pw = simpledialog.askstring(
+                    "Нужны права root",
+                    "Для записи в устройство нужен пароль администратора.\n"
+                    "Он не сохраняется и нужен только на время работы окна.",
+                    show="*", parent=root)
+                if pw is None:
+                    return None, "отменено"
+                state["pw"] = pw
+            cmd = ["sudo", "-S", "-k", "-p", "", sys.executable, SCRIPT] + argv
+            if force:
+                cmd.append(FORCE_FLAG)
+            try:
+                r = subprocess.run(cmd, input=state["pw"] + "\n", capture_output=True,
+                                   text=True, timeout=30)
+            except subprocess.TimeoutExpired:
+                return False, "таймаут sudo"
+            if r.returncode == 0:
+                return True, ""
+            if r.returncode in (EXIT_USAGE, EXIT_REFUSED, EXIT_NODEV, EXIT_IO,
+                                EXIT_PERM, EXIT_CRASH):
+                return False, (r.stderr or r.stdout).strip()
+            state["pw"] = None  # не наш код возврата: скорее всего неверный пароль
+            messagebox.showwarning("Пароль", "Пароль не подошёл, попробуй ещё раз.", parent=root)
+        return False, "неверный пароль"
+
+    def apply():
+        m = mode.get()
+        try:
+            col = color.get().lstrip("#")
+            fr = build(m, col if m != "off" else "000000", speed.get())
+        except ValueError as e:
+            set_status(f"Ошибка: {e}", ok=False)
+            return
+        try:
+            d = resolve(force)
+        except NoDevice as e:
+            check_device()
+            set_status(str(e), ok=False)
+            return
+        except Refused as e:
+            check_device()
+            messagebox.showerror("Не те наушники", str(e), parent=root)
+            set_status("Отказ: модель не подходит", ok=False)
+            return
+        try:
+            write_frames(d.node, fr)
+            set_status("Применено")
+            return
+        except PermissionError:
+            pass
+        except OSError as e:
+            set_status(f"Ошибка записи: {e}", ok=False)
+            return
+        argv = [m, col if m != "off" else "000000"]
+        if m == "breathe":
+            argv.append(str(speed.get()))
+        ok, err = run_as_root(argv + ["--send"])
+        if ok:
+            set_status("Применено (через root)")
+        elif ok is None:
+            set_status("Отменено", ok=False)
+        else:
+            set_status("Ошибка", ok=False)
+            messagebox.showerror("Не получилось", err or "неизвестная ошибка", parent=root)
+
+    tk.Button(root, text="Применить", command=apply, font=("", 11, "bold")).pack(pady=8)
+    status_lbl = tk.Label(root, textvariable=status)
+    status_lbl.pack(pady=(0, 10))
+
+    refresh()
+    first = check_device()
+    if isinstance(first, Refused):
+        messagebox.showerror("Не те наушники", str(first), parent=root)
+    root.mainloop()
+    return 0
+
+
+def main():
+    argv = sys.argv[1:]
+    force = FORCE_FLAG in argv
+    rest = [a for a in argv if a != FORCE_FLAG]
+    if not rest or rest[0] == "gui":
+        return gui(force)
+    return cli(argv)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception as e:  # чтобы sudo не перепутал падение с неверным паролем
+        print(f"внутренняя ошибка: {e!r}", file=sys.stderr)
+        sys.exit(EXIT_CRASH)
